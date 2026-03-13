@@ -1,0 +1,142 @@
+import streamlit as st
+import pandas as pd
+import re
+
+from loader import load_excel
+from parser_tables import parse_table
+from data_cleaner import clean_database
+
+# --- ПОИСК КОДА ВОПРОСА ---
+def get_clean_code(text):
+    if not isinstance(text, str): return None
+    match = re.search(r"\b([abpqs]\d+[a-z]*\d*(?:[_r]+\d+)?)\b", text, re.IGNORECASE)
+    if match: return match.group(1)
+    return None
+
+# --- УЛУЧШЕННЫЙ ПОИСК НОМЕРА СТРОКИ ---
+def extract_row_number(text):
+    """Ищет номер варианта в названии строки таблицы"""
+    text_clean = str(text).lower()
+    # Сначала ищем r4 или _4 (ваш случай)
+    match = re.search(r"[r_](\d+)", text_clean)
+    if match: return match.group(1)
+    # Если нет r/_, ищем просто первую цифру (напр. '4. Метастатический')
+    match = re.search(r"(\d+)", text_clean)
+    if match: return match.group(1)
+    return None
+
+# --- ИНТЕРФЕЙС ---
+st.set_page_config(page_title="Research Validator", layout="wide")
+st.markdown("# 📊 Research Table Validator")
+
+col1, col2 = st.columns(2)
+with col1:
+    tables_file = st.file_uploader("📄 Таблицы (Excel)", type=["xlsx"])
+with col2:
+    db_file = st.file_uploader("🗄 База (Excel)", type=["xlsx"])
+
+if tables_file and db_file:
+    # Загружаем данные
+    all_sheets = load_excel(tables_file)
+    sheet_name = st.selectbox("📑 Выберите лист", list(all_sheets.keys()))
+    
+    # Важно: читаем базу и выводим инфо о колонках для отладки
+    db_raw = pd.read_excel(db_file)
+    db = clean_database(db_raw)
+    db_cols = list(db.columns)
+
+    if st.button("🔍 Запустить проверку", use_container_width=True):
+        df = all_sheets[sheet_name]
+        
+        # Поиск начала таблиц
+        starts = []
+        for i in range(len(df)):
+            cell_val = str(df.iloc[i, 0])
+            if get_clean_code(cell_val) and "back to toc" not in cell_val.lower():
+                if not starts or i - starts[-1] > 2:
+                    starts.append(i)
+
+        for i in range(len(starts)):
+            s_idx = starts[i]
+            e_idx = starts[i+1] if i+1 < len(starts) else len(df)
+            block = df.iloc[s_idx:e_idx].reset_index(drop=True)
+            
+            qcode = get_clean_code(str(block.iloc[0, 0]))
+            
+            # 1. Определяем тип (Share или нет)
+            header_text = " ".join(block.iloc[0:5, 0:2].astype(str).values.flatten()).lower()
+            is_share = any(x in header_text for x in ["share", "% share", "column share"])
+
+            if qcode:
+                with st.expander(f"📦 Таблица: {qcode}", expanded=True):
+                    # --- ПОИСК ВСЕХ КОЛОНОК ВОПРОСА В БАЗЕ ---
+                    q_prefix = qcode.lower()
+                    related_cols = [c for c in db_cols if c.lower().startswith(q_prefix)]
+                    
+                    if not related_cols:
+                        st.error(f"Колонки для {qcode} не найдены в базе. Проверьте названия!")
+                        continue
+
+                    labels, values = parse_table(block)
+                    comp_data = []
+                    
+                    # Считаем общую сумму по всем колонкам вопроса для Share
+                    global_question_sum = db[related_cols].sum().sum()
+
+                    for j in range(len(labels)):
+                        txt = labels[j]
+                        if any(w in txt for w in ["Column n", "Base", "Total"]): continue
+                        
+                        row_num = extract_row_number(txt)
+                        t_val = values[j]
+                        
+                        # --- ПОИСК КОНКРЕТНОЙ КОЛОНКИ ---
+                        target_col = None
+                        if row_num:
+                            for c in related_cols:
+                                c_low = c.lower()
+                                # Ищем r4, _4 или просто 4 в названии колонки базы
+                                if f"r{row_num}" in c_low or f"_{row_num}" in c_low or c_low.endswith(str(row_num)):
+                                    target_col = c
+                                    break
+                        
+                        # --- РАСЧЕТ ---
+                        db_val = None
+                        status_info = ""
+
+                        if target_col:
+                            if is_share:
+                                # Доля = сумма этой колонки / сумма всех колонок вопроса
+                                if global_question_sum > 0:
+                                    db_val = db[target_col].sum() / global_question_sum
+                                    status_info = f"Share от {target_col}"
+                            else:
+                                # Обычное среднее (Average)
+                                db_val = db[target_col].mean()
+                                status_info = f"Mean от {target_col}"
+                        else:
+                            status_info = "Колонка не найдена"
+
+                        # --- СРАВНЕНИЕ ---
+                        if t_val is not None and db_val is not None:
+                            # Масштабируем (0.29 vs 29.31)
+                            if t_val > 1.0: t_val /= 100.0
+                            if db_val > 1.0: db_val /= 100.0
+                            
+                            diff = abs(t_val - db_val)
+                            comp_data.append({
+                                "Строка таблицы": txt,
+                                "Найдена колонка": target_col,
+                                "Таблица": t_val,
+                                "База": db_val,
+                                "Разница": diff,
+                                "Статус": "OK" if diff <= 0.001 else "ERROR"
+                            })
+                    
+                    if comp_data:
+                        res_df = pd.DataFrame(comp_data)
+                        st.dataframe(
+                            res_df.style.apply(lambda r: ['background-color: #ffcccc' if r.Статус == 'ERROR' else 'background-color: #ccffcc' for _ in r], axis=1)
+                            .format({"Таблица": "{:.2%}", "База": "{:.2%}", "Разница": "{:.4f}"}),
+                            use_container_width=True
+                        )
